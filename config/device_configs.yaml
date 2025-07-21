@@ -1,0 +1,164 @@
+# Device Memory Testing Configuration
+# Configure multiple devices and test scenarios for parallel execution
+
+devices:
+  # Production Device 1 - UI Container Testing
+  prod_ui_device:
+    connection:
+      hostname: "192.168.1.100"
+      port: 22
+      username: "admin"
+      password: "admin123"
+      # key_file: "/path/to/ssh/key"  # Alternative to password
+    
+    test_scenarios:
+      - name: "ui_container_memory_test"
+        container_id: "netconf-ui"  # Can be container name or ID
+        process_pid: 1  # Will auto-discover if not specified
+        memory_limit: "5g"
+        profiler: "valgrind"
+        profiling_duration: 120  # seconds
+        restore_memory: true
+        
+        # NETCONF testing options
+        netconf:
+          host: "192.168.1.100"  # Same as device or different
+          port: 830
+          username: "netconf_user"
+          password: "netconf_pass"
+          rpc_dir: "test_data/sample_rpcs"
+        
+        # Output configuration
+        output:
+          session_name: "prod_ui_test"
+          output_dir: "results/prod_ui_device"
+          
+      - name: "backend_container_test"
+        container_id: "netconf-backend"
+        process_pid: 1
+        memory_limit: "3g"
+        profiler: "valgrind"
+        profiling_duration: 90
+        restore_memory: true
+        
+        output:
+          session_name: "prod_backend_test"
+          output_dir: "results/prod_ui_device"
+
+  # Production Device 2 - Backend Testing
+  prod_backend_device:
+    connection:
+      hostname: "192.168.1.101"
+      port: 22
+      username: "admin"
+      password: "admin123"
+    
+    test_scenarios:
+      - name: "netconf_daemon_test"
+        container_id: "netconf-server"
+        memory_limit: "4g"
+        profiler: "valgrind"
+        profiling_duration: 180
+        restore_memory: true
+        
+        netconf:
+          host: "192.168.1.101"
+          port: 830
+          username: "admin"
+          password: "admin123"
+          rpc_dir: "test_data/sample_rpcs"
+        
+        output:
+          session_name: "netconf_daemon_stress"
+          output_dir: "results/prod_backend_device"
+
+  # Development Device - Quick Testing
+  dev_device:
+    connection:
+      hostname: "192.168.1.200"
+      port: 22
+      username: "developer"
+      password: "dev123"
+    
+    test_scenarios:
+      - name: "dev_quick_test"
+        container_id: "dev-netconf-ui"
+        memory_limit: "2g"
+        profiler: "valgrind"
+        profiling_duration: 60
+        restore_memory: true
+        
+        output:
+          session_name: "dev_test"
+          output_dir: "results/dev_device"
+
+  # Lab Device - Multiple Container Testing
+  lab_device:
+    connection:
+      hostname: "lab.company.com"
+      port: 2222
+      username: "testuser"
+      key_file: "~/.ssh/lab_key"
+    
+    test_scenarios:
+      - name: "ui_container_test"
+        container_id: "lab-ui"
+        memory_limit: "6g"
+        profiler: "valgrind"
+        profiling_duration: 300
+        restore_memory: true
+        
+      - name: "api_container_test"
+        container_id: "lab-api"
+        memory_limit: "4g" 
+        profiler: "valgrind"
+        profiling_duration: 180
+        restore_memory: true
+        
+      - name: "datastore_test"
+        container_id: "lab-datastore"
+        memory_limit: "3g"
+        profiler: "valgrind"
+        profiling_duration: 120
+        restore_memory: true
+
+# Global test configuration
+global_config:
+  # Parallel execution settings
+  max_parallel_devices: 3
+  max_parallel_tests_per_device: 2
+  
+  # Default timeouts
+  connection_timeout: 30
+  test_timeout: 3600  # 1 hour max per test
+  
+  # Retry settings
+  max_retries: 2
+  retry_delay: 60  # seconds
+  
+  # Logging
+  log_level: "INFO"
+  log_file: "logs/parallel_device_testing.log"
+  
+  # Output settings
+  consolidated_report: true
+  consolidated_report_dir: "results/consolidated"
+  
+  # Cleanup settings
+  cleanup_on_failure: true
+  preserve_logs_on_failure: true
+
+# Email notifications (optional)
+notifications:
+  enabled: false
+  smtp_server: "mail.company.com"
+  smtp_port: 587
+  from_email: "testing@company.com"
+  to_emails:
+    - "devops@company.com"
+    - "qa@company.com"
+  
+  # Notification triggers
+  notify_on_completion: true
+  notify_on_failure: true
+  notify_on_high_priority_leaks: true 

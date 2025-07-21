@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  netconf-analyzer:
+    build: .
+    container_name: netconf-memory-analyzer
+    volumes:
+      # Mount source code for development
+      - .:/app
+      # Mount SSH keys (if using key-based auth)
+      - ~/.ssh:/home/analyzer/.ssh:ro
+      # Mount results directory
+      - ./results:/app/results
+      - ./logs:/app/logs
+      - ./analysis_reports:/app/analysis_reports
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+    # Override entrypoint for development
+    entrypoint: /bin/bash
+    stdin_open: true
+    tty: true
+    networks:
+      - netconf-network
+
+  # Optional: Local GUI display (X11 forwarding)
+  netconf-analyzer-gui:
+    build: .
+    container_name: netconf-memory-analyzer-gui
+    volumes:
+      - .:/app
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./results:/app/results
+      - ./logs:/app/logs
+    environment:
+      - DISPLAY=${DISPLAY}
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+    command: python memory_leak_analyzer.py --gui
+    networks:
+      - netconf-network
+    depends_on:
+      - netconf-analyzer
+
+  # Optional: Documentation server
+  docs:
+    image: nginx:alpine
+    container_name: netconf-docs
+    ports:
+      - "8080:80"
+    volumes:
+      - ./docs/_build/html:/usr/share/nginx/html:ro
+    networks:
+      - netconf-network
+
+networks:
+  netconf-network:
+    driver: bridge
+
+# Development override
+# Use: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+---
+# docker-compose.dev.yml - Development overrides
+version: '3.8'
+
+services:
+  netconf-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      # Mount entire source for live development
+      - .:/app
+      # Mount Python cache for faster rebuilds
+      - dev-python-cache:/home/analyzer/.cache
+    environment:
+      - DEBUG=1
+      - LOG_LEVEL=DEBUG
+    ports:
+      - "8000:8000"  # For development server if needed
+
+volumes:
+  dev-python-cache: 

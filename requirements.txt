@@ -1,0 +1,26 @@
+# Netconf Memory Leak Analyzer - Python Dependencies
+
+# Core dependencies
+PyYAML>=6.0
+paramiko>=2.7.0
+lxml>=4.6.0
+
+# Optional GUI dependencies
+tkinter-tooltip>=2.0.0
+
+# Optional plotting and visualization
+matplotlib>=3.3.0
+plotly>=5.0.0
+
+# Optional database for trend analysis
+sqlite3
+
+# Development and testing dependencies (optional)
+pytest>=6.0.0
+pytest-cov>=2.10.0
+black>=21.0.0
+flake8>=3.8.0
+
+# Documentation (optional)
+sphinx>=4.0.0
+sphinx-rtd-theme>=0.5.0 
