@@ -12,8 +12,6 @@ tkinter-tooltip>=2.0.0
 matplotlib>=3.3.0
 plotly>=5.0.0
 
-# Optional database for trend analysis
-sqlite3
 
 # Development and testing dependencies (optional)
 pytest>=6.0.0
