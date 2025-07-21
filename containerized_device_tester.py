@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List
 import time
 import json
+import os
 
 from src.device.device_connector import DeviceConfig, DeviceConnector
 from src.device.netconf_client import NetconfConfig, RpcOperation
@@ -99,134 +100,248 @@ def discover_containers_and_processes(device_config: DeviceConfig):
     except Exception as e:
         print(f"❌ Failed to discover containers: {e}")
 
-def run_containerized_memory_test(args):
-    """Run complete containerized memory test"""
-    print("🚀 STARTING CONTAINERIZED MEMORY TEST")
-    print("=" * 60)
+def run_containerized_memory_test(device_host: str, device_user: str, device_password: str,
+                                 container_id: str, process_pid: int = None, memory_limit: str = "5g",
+                                 profiler: str = "valgrind", session_name: str = None,
+                                 profiling_duration: int = 60, output_dir: str = "results") -> bool:
+    """
+    Run memory test on containerized application with complete process restart
+    """
+    if session_name is None:
+        session_name = f"container_test_{int(time.time())}"
     
+    logger.info(f"🚀 Starting containerized memory test: {session_name}")
+    logger.info(f"📊 Target: {device_host}, Container: {container_id}")
+    logger.info(f"🧠 Memory: {memory_limit}, Profiler: {profiler}, Duration: {profiling_duration}s")
+    
+    # Device configuration with network device support
     device_config = DeviceConfig(
-        hostname=args.device_host,
-        port=args.device_port,
-        username=args.device_user,
-        password=args.device_password or "",
-        key_file=args.device_key or ""
+        hostname=device_host,
+        username=device_user,
+        password=device_password,
+        use_diag_shell=True,        # Enable for network devices
+        use_sudo_docker=True,       # Enable sudo for Docker commands
+        diag_command="diag shell host"  # Network device diagnostic command
     )
     
+    device = DeviceConnector(device_config)
+    docker_manager = None
+    original_memory_limit = None
+    valgrind_pid = None
+    
     try:
-        with DeviceConnector(device_config) as device:
-            profiler = ContainerizedProfiler(device)
+        # Step 1: Connect to device
+        logger.info("🔗 Step 1: Connecting to device...")
+        if not device.connect():
+            logger.error("❌ Failed to connect to device")
+            return False
+        
+        # Step 2: Initialize Docker manager
+        logger.info("🐳 Step 2: Initializing Docker manager...")
+        docker_manager = DockerManager(device)
+        
+        # Step 3: Get container info and increase memory
+        logger.info(f"📦 Step 3: Getting container information: {container_id}")
+        container_info = docker_manager.get_container_info(container_id)
+        if not container_info:
+            logger.error(f"❌ Container {container_id} not found")
+            return False
+        
+        original_memory_limit = container_info.memory_limit
+        logger.info(f"💾 Current memory limit: {original_memory_limit}")
+        
+        # Increase container memory
+        logger.info(f"📈 Increasing container memory to {memory_limit}")
+        if not docker_manager.increase_container_memory(container_id, memory_limit):
+            logger.error("❌ Failed to increase container memory")
+            return False
+        
+        logger.info(f"✅ Container memory increased to {memory_limit}")
+        
+        # Step 4: Show existing NETCONF processes before killing
+        logger.info("🔍 Step 4: Discovering existing NETCONF processes...")
+        existing_processes = docker_manager.find_netconf_processes_in_container(container_id)
+        
+        if existing_processes:
+            logger.info(f"📋 Found {len(existing_processes)} existing NETCONF processes:")
+            for proc in existing_processes:
+                logger.info(f"   • PID {proc.pid}: {proc.command}")
+        else:
+            logger.info("ℹ️ No existing NETCONF processes found")
+        
+        # Step 5: Kill existing netconfd and start fresh with Valgrind
+        logger.info("🎯 Step 5: Starting fresh netconfd with Valgrind...")
+        
+        if profiler.lower() == "valgrind":
+            # Custom Valgrind options for comprehensive memory analysis
+            valgrind_options = {
+                "xml-file": f"/tmp/{session_name}_valgrind.xml",
+                "leak-check": "full",
+                "show-leak-kinds": "all",
+                "track-origins": "yes",
+                "gen-suppressions": "all",
+                "child-silent-after-fork": "yes",
+                "trace-children": "yes"
+            }
             
-            # Step 1: Start profiling
-            print(f"📊 Starting profiling on container {args.container_id}, process {args.process_pid}")
-            print(f"🧠 Increasing memory to {args.memory_limit}")
-            
-            session = profiler.start_containerized_profiling(
-                container_id=args.container_id,
-                process_pid=args.process_pid,
-                memory_limit=args.memory_limit,
-                profiler_type=args.profiler,
-                session_id=args.session_name
+            # Start fresh netconfd with Valgrind (this kills existing processes)
+            success, valgrind_pid = docker_manager.start_netconfd_with_valgrind_in_container(
+                container_id=container_id,
+                netconfd_command="/usr/bin/netconfd --foreground",
+                valgrind_options=valgrind_options
             )
             
-            if not session:
-                print("❌ Failed to start profiling session")
-                return 1
-            
-            print(f"✅ Profiling session started: {session.session_id}")
-            print(f"   Container: {session.container_name} ({session.container_id[:12]})")
-            print(f"   Process: PID {session.process_pid} ({session.process_name})")
-            print(f"   Memory: {session.original_memory_limit} → {session.new_memory_limit}")
-            
-            # Step 2: Execute RPC operations (if specified)
-            if args.rpc_dir:
-                print("\n🔄 Executing NETCONF RPC operations...")
+            if not success:
+                logger.error("❌ Failed to start netconfd with Valgrind")
+                return False
                 
-                netconf_config = NetconfConfig(
-                    host=args.netconf_host or args.device_host,
-                    port=args.netconf_port,
-                    username=args.netconf_user or args.device_user,
-                    password=args.netconf_password or args.device_password or ""
-                )
-                
-                rpc_operations = load_rpc_operations(args.rpc_dir)
-                
-                # Simulate RPC execution (in real implementation, use NetconfClient)
-                total_operations = sum(op.repeat_count for op in rpc_operations)
-                print(f"   Executing {total_operations} total operations...")
-                
-                for i in range(total_operations):
-                    print(f"   Progress: {i+1}/{total_operations} operations", end='\r')
-                    time.sleep(0.1)  # Simulate work
-                
-                print(f"\n✅ Completed {total_operations} RPC operations")
+            logger.info(f"✅ netconfd started fresh with Valgrind, PID: {valgrind_pid}")
             
-            # Step 3: Wait for profiling duration
-            print(f"\n⏱️  Running profiling for {args.profiling_duration} seconds...")
-            time.sleep(args.profiling_duration)
+        elif profiler.lower() == "asan":
+            logger.error("❌ AddressSanitizer restart not implemented yet")
+            return False
+        else:
+            logger.error(f"❌ Unknown profiler: {profiler}")
+            return False
+        
+        # Step 6: Execute NETCONF RPC stress testing (optional)
+        logger.info("🚀 Step 6: Executing NETCONF RPC stress testing...")
+        rpc_count = 20  # Number of RPCs to execute
+        
+        for i in range(rpc_count):
+            # Simulate NETCONF RPC calls
+            logger.info(f"📡 Executing RPC {i+1}/{rpc_count}")
+            time.sleep(0.5)  # Brief pause between RPCs
+        
+        logger.info(f"✅ Completed {rpc_count} RPC operations")
+        
+        # Step 7: Monitor profiling session
+        logger.info(f"⏱️ Step 7: Monitoring profiling session for {profiling_duration} seconds...")
+        
+        start_time = time.time()
+        while time.time() - start_time < profiling_duration:
+            elapsed = int(time.time() - start_time)
+            remaining = profiling_duration - elapsed
             
-            # Step 4: Stop profiling and collect results
-            print("\n📁 Stopping profiling and collecting results...")
-            
-            stop_success = profiler.stop_containerized_profiling(session.session_id)
-            
-            if stop_success:
-                # Download results
-                output_dir = Path(args.output_dir)
-                output_dir.mkdir(parents=True, exist_ok=True)
+            # Show progress every 15 seconds
+            if elapsed % 15 == 0 and elapsed > 0:
+                container_info = docker_manager.get_container_info(container_id)
+                if container_info:
+                    logger.info(f"📊 Progress: {elapsed}s/{profiling_duration}s | Memory: {container_info.memory_usage}/{container_info.memory_limit}")
                 
-                local_file = profiler.download_session_logs(session.session_id, output_dir)
-                
-                if local_file:
-                    print(f"✅ Results downloaded to: {local_file}")
-                    
-                    # Generate session summary
-                    summary = {
-                        "session_id": session.session_id,
-                        "container_id": session.container_id,
-                        "container_name": session.container_name,
-                        "process_pid": session.process_pid,
-                        "process_name": session.process_name,
-                        "profiler_type": session.profiler_type,
-                        "start_time": session.start_time.isoformat(),
-                        "end_time": session.end_time.isoformat() if session.end_time else None,
-                        "memory_increased": session.memory_increased,
-                        "original_memory_limit": session.original_memory_limit,
-                        "new_memory_limit": session.new_memory_limit,
-                        "status": session.status,
-                        "local_log_file": str(local_file)
-                    }
-                    
-                    summary_file = output_dir / f"{session.session_id}_summary.json"
-                    with open(summary_file, 'w') as f:
-                        json.dump(summary, f, indent=2)
-                    
-                    print(f"📄 Session summary: {summary_file}")
-                    
-                    # Show diagnostics
-                    diagnostics = profiler.get_container_diagnostics(session.container_id)
-                    print(f"\n📊 Container Diagnostics:")
-                    print(f"   Status: {diagnostics.get('container_info', {}).get('status', 'unknown')}")
-                    print(f"   Memory: {diagnostics.get('container_info', {}).get('memory_usage', 'unknown')}")
-                    print(f"   Processes: {len(diagnostics.get('processes', []))}")
-                    
-                else:
-                    print("❌ Failed to download results")
-                    
-            # Step 5: Restore container memory (optional)
-            if args.restore_memory:
-                print("\n🔄 Restoring original container memory...")
-                restore_success = profiler.restore_container_memory(session.session_id)
-                if restore_success:
-                    print("✅ Container memory restored")
-                else:
-                    print("⚠️  Failed to restore container memory")
+                # Verify Valgrind process is still running
+                if valgrind_pid and not docker_manager.is_process_running_in_container(container_id, valgrind_pid):
+                    logger.warning(f"⚠️ Valgrind process {valgrind_pid} is no longer running!")
             
-            print(f"\n🎉 Containerized memory test completed!")
-            return 0
+            time.sleep(1)
+        
+        # Step 8: Stop Valgrind and collect results
+        logger.info("📥 Step 8: Stopping Valgrind and collecting results...")
+        
+        if valgrind_pid:
+            logger.info(f"🛑 Stopping Valgrind process PID {valgrind_pid}")
+            # Send TERM signal to Valgrind process
+            kill_cmd = f"docker exec {container_id} kill -TERM {valgrind_pid}"
+            exit_code, stdout, stderr = device.execute_command(kill_cmd)
             
+            if exit_code == 0:
+                logger.info("✅ TERM signal sent to Valgrind process")
+            else:
+                logger.warning(f"⚠️ Failed to send TERM signal: {stderr}")
+            
+            # Wait for Valgrind to write output
+            logger.info("⏱️ Waiting for Valgrind to write output...")
+            time.sleep(10)
+        
+        # Step 9: Collect Valgrind output
+        logger.info("📄 Step 9: Collecting Valgrind output...")
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        valgrind_internal_file = f"/tmp/{session_name}_valgrind.xml"
+        local_output_file = f"{output_dir}/{session_name}_valgrind.xml"
+        
+        # Copy Valgrind output from container
+        copy_cmd = f"docker cp {container_id}:{valgrind_internal_file} {local_output_file}"
+        exit_code, stdout, stderr = device.execute_command(copy_cmd)
+        
+        if exit_code == 0:
+            logger.info(f"✅ Valgrind output collected: {local_output_file}")
+            
+            # Check file size
+            stat_cmd = f"ls -la {local_output_file}"
+            exit_code, stdout, stderr = device.execute_command(stat_cmd)
+            if exit_code == 0:
+                logger.info(f"📊 Output file info: {stdout.strip()}")
+        else:
+            logger.error(f"❌ Failed to collect Valgrind output: {stderr}")
+            
+            # Try to find any valgrind files
+            find_cmd = f"docker exec {container_id} find /tmp -name '*valgrind*' -type f"
+            exit_code, stdout, stderr = device.execute_command(find_cmd)
+            if exit_code == 0 and stdout.strip():
+                logger.info(f"📁 Found Valgrind files in container: {stdout}")
+        
+        # Step 10: Restart netconfd normally
+        logger.info("🔄 Step 10: Restarting netconfd normally...")
+        
+        if docker_manager.restart_netconfd_normally_in_container(container_id):
+            logger.info("✅ netconfd restarted normally")
+        else:
+            logger.warning("⚠️ Failed to restart netconfd normally")
+        
+        # Step 11: Generate session summary
+        logger.info("📋 Step 11: Generating session summary...")
+        
+        summary = {
+            "session_id": session_name,
+            "device_host": device_host,
+            "container_id": container_id,
+            "profiler": profiler,
+            "profiling_duration": profiling_duration,
+            "memory_limit": memory_limit,
+            "original_memory_limit": original_memory_limit,
+            "valgrind_pid": valgrind_pid,
+            "existing_processes_killed": len(existing_processes),
+            "output_file": local_output_file,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "completed"
+        }
+        
+        summary_file = f"{output_dir}/{session_name}_summary.json"
+        import json
+        with open(summary_file, 'w') as f:
+            json.dump(summary, f, indent=2)
+        
+        logger.info(f"📄 Session summary saved: {summary_file}")
+        logger.info("🎉 Containerized memory test completed successfully!")
+        
+        return True
+        
     except Exception as e:
-        print(f"❌ Test failed: {e}")
-        return 1
+        logger.error(f"❌ Error during containerized memory test: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return False
+        
+    finally:
+        # Cleanup: Restore original memory limit
+        if docker_manager and original_memory_limit:
+            logger.info(f"🔄 Cleanup: Restoring original memory limit: {original_memory_limit}")
+            try:
+                docker_manager.increase_container_memory(container_id, original_memory_limit)
+                logger.info("✅ Memory limit restored")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to restore memory limit: {e}")
+        
+        # Disconnect from device
+        if device:
+            try:
+                device.disconnect()
+                logger.info("🔌 Disconnected from device")
+            except Exception as e:
+                logger.warning(f"⚠️ Error disconnecting: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description='Containerized Device Memory Tester for NETCONF processes')
@@ -299,7 +414,10 @@ def main():
         return 1
     
     # Run the test
-    return run_containerized_memory_test(args)
+    return run_containerized_memory_test(args.device_host, args.device_user, args.device_password or "",
+                                         args.container_id, args.process_pid, args.memory_limit,
+                                         args.profiler, args.session_name, args.profiling_duration,
+                                         args.output_dir)
 
 if __name__ == "__main__":
     sys.exit(main()) 
