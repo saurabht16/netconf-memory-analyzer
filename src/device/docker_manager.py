@@ -43,12 +43,175 @@ class DockerManager:
         self.device = device_connector
         self.logger = logging.getLogger(__name__)
         
+    def find_target_netconf_container(self, preferred_patterns: List[str] = None) -> Optional[ContainerInfo]:
+        """Find the target NETCONF container efficiently - stops on first match"""
+        try:
+            self.logger.info("🔍 Searching for target NETCONF container...")
+            
+            # Default patterns ordered by preference (UI containers first, then NETCONF)
+            if preferred_patterns is None:
+                preferred_patterns = [
+                    'ui', 'frontend', 'netconf-ui', 'web-ui',
+                    'netconf', 'netconfd', 'confd', 'sysrepo', 
+                    'backend', 'api', 'server', 'yanglint', 'netopeer'
+                ]
+            
+            # Search for containers using targeted docker commands
+            for pattern in preferred_patterns:
+                self.logger.debug(f"   Searching for pattern: {pattern}")
+                
+                # Use docker ps with name filter for efficiency
+                docker_cmd = f"sudo docker ps --filter name={pattern} --format '{{{{.ID}}}}\\t{{{{.Names}}}}\\t{{{{.Image}}}}\\t{{{{.Status}}}}\\t{{{{.Ports}}}}\\t{{{{.CreatedAt}}}}'"
+                exit_code, stdout, stderr = self.device.execute_command(docker_cmd, timeout=10)
+                
+                if exit_code == 0 and stdout.strip():
+                    lines = stdout.strip().split('\n')
+                    for line in lines:
+                        if line.strip():
+                            parts = line.split('\t')
+                            if len(parts) >= 4:
+                                container_id = parts[0]
+                                container_name = parts[1]
+                                
+                                self.logger.info(f"🎯 Found target container: {container_name} ({container_id[:12]})")
+                                
+                                # Get memory info only for this container
+                                memory_info = self._get_container_memory_info(container_id)
+                                
+                                container_info = ContainerInfo(
+                                    container_id=container_id,
+                                    name=container_name,
+                                    image=parts[2],
+                                    status=parts[3],
+                                    memory_limit=memory_info.get('limit', 'unknown'),
+                                    memory_usage=memory_info.get('usage', 'unknown'),
+                                    cpu_usage=memory_info.get('cpu', 'unknown'),
+                                    ports=parts[4].split(',') if len(parts) > 4 and parts[4] else [],
+                                    created=parts[5] if len(parts) > 5 else 'unknown'
+                                )
+                                
+                                # Verify it has NETCONF processes before returning
+                                if self._verify_netconf_container(container_id):
+                                    self.logger.info(f"✅ Confirmed NETCONF container: {container_name}")
+                                    return container_info
+                                else:
+                                    self.logger.debug(f"   Container {container_name} has no NETCONF processes, continuing search...")
+            
+            # Fallback: search by image patterns
+            self.logger.info("   Trying image-based search...")
+            image_patterns = ['netconf', 'confd', 'sysrepo', 'ui']
+            
+            for pattern in image_patterns:
+                docker_cmd = f"sudo docker ps --filter ancestor={pattern} --format '{{{{.ID}}}}\\t{{{{.Names}}}}\\t{{{{.Image}}}}\\t{{{{.Status}}}}'"
+                exit_code, stdout, stderr = self.device.execute_command(docker_cmd, timeout=10)
+                
+                if exit_code == 0 and stdout.strip():
+                    lines = stdout.strip().split('\n')
+                    for line in lines:
+                        if line.strip():
+                            parts = line.split('\t')
+                            if len(parts) >= 4:
+                                container_id = parts[0]
+                                container_name = parts[1]
+                                
+                                self.logger.info(f"🎯 Found container by image: {container_name} ({container_id[:12]})")
+                                
+                                if self._verify_netconf_container(container_id):
+                                    memory_info = self._get_container_memory_info(container_id)
+                                    
+                                    container_info = ContainerInfo(
+                                        container_id=container_id,
+                                        name=container_name,
+                                        image=parts[2],
+                                        status=parts[3],
+                                        memory_limit=memory_info.get('limit', 'unknown'),
+                                        memory_usage=memory_info.get('usage', 'unknown'),
+                                        cpu_usage=memory_info.get('cpu', 'unknown'),
+                                        ports=[],
+                                        created='unknown'
+                                    )
+                                    
+                                    self.logger.info(f"✅ Confirmed NETCONF container: {container_name}")
+                                    return container_info
+            
+            self.logger.warning("❌ No target NETCONF container found")
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error finding target NETCONF container: {e}")
+            return None
+    
+    def _verify_netconf_container(self, container_id: str) -> bool:
+        """Quick verification that container has NETCONF processes"""
+        try:
+            # Quick check for NETCONF processes without full parsing
+            ps_cmd = f"sudo docker exec {container_id} ps aux | grep -E 'netconf|confd' | grep -v grep"
+            exit_code, stdout, stderr = self.device.execute_command(ps_cmd, timeout=5)
+            
+            has_netconf = exit_code == 0 and stdout.strip()
+            self.logger.debug(f"   Container {container_id[:12]} NETCONF verification: {'✅' if has_netconf else '❌'}")
+            return has_netconf
+            
+        except Exception:
+            return False
+    
+    def get_target_container_details(self, container_id: str) -> Optional[ContainerInfo]:
+        """Get detailed information for a specific container only"""
+        try:
+            self.logger.info(f"📊 Getting details for container {container_id[:12]}")
+            
+            # Get basic container info
+            inspect_cmd = f"sudo docker inspect {container_id} --format '{{{{.Name}}}}|{{{{.Config.Image}}}}|{{{{.State.Status}}}}|{{{{.Created}}}}'"
+            exit_code, stdout, stderr = self.device.execute_command(inspect_cmd, timeout=10)
+            
+            if exit_code != 0:
+                self.logger.error(f"Failed to inspect container: {stderr}")
+                return None
+            
+            parts = stdout.strip().split('|')
+            if len(parts) < 4:
+                return None
+            
+            container_name = parts[0].lstrip('/')  # Remove leading slash
+            image = parts[1]
+            status = parts[2]
+            created = parts[3]
+            
+            # Get memory info
+            memory_info = self._get_container_memory_info(container_id)
+            
+            # Get port mappings
+            ports_cmd = f"sudo docker port {container_id}"
+            exit_code, port_output, _ = self.device.execute_command(ports_cmd, timeout=5)
+            ports = port_output.strip().split('\n') if exit_code == 0 and port_output.strip() else []
+            
+            container_info = ContainerInfo(
+                container_id=container_id,
+                name=container_name,
+                image=image,
+                status=status,
+                memory_limit=memory_info.get('limit', 'unknown'),
+                memory_usage=memory_info.get('usage', 'unknown'),
+                cpu_usage=memory_info.get('cpu', 'unknown'),
+                ports=ports,
+                created=created
+            )
+            
+            self.logger.info(f"✅ Container details: {container_name} | Status: {status} | Memory: {memory_info.get('usage', '?')}/{memory_info.get('limit', '?')}")
+            return container_info
+            
+        except Exception as e:
+            self.logger.error(f"Error getting container details: {e}")
+            return None
+
+    # Keep original methods for backward compatibility but mark as deprecated
     def list_containers(self, show_all: bool = True) -> List[ContainerInfo]:
-        """List all Docker containers on the device"""
+        """List all Docker containers on the device - DEPRECATED: Use find_target_netconf_container() for efficiency"""
+        self.logger.warning("⚠️ list_containers() is deprecated for efficiency. Use find_target_netconf_container() instead.")
         try:
             # Get container information using docker ps
             cmd_filter = "-a" if show_all else ""
-            docker_cmd = f"docker ps {cmd_filter} --format 'table {{{{.ID}}}}\\t{{{{.Names}}}}\\t{{{{.Image}}}}\\t{{{{.Status}}}}\\t{{{{.Ports}}}}\\t{{{{.CreatedAt}}}}'"
+            docker_cmd = f"sudo docker ps {cmd_filter} --format 'table {{{{.ID}}}}\\t{{{{.Names}}}}\\t{{{{.Image}}}}\\t{{{{.Status}}}}\\t{{{{.Ports}}}}\\t{{{{.CreatedAt}}}}'"
             
             exit_code, stdout, stderr = self.device.execute_command(docker_cmd)
             
@@ -86,7 +249,8 @@ class DockerManager:
             return []
     
     def find_netconf_containers(self) -> List[ContainerInfo]:
-        """Find containers that likely contain NETCONF applications"""
+        """Find containers that likely contain NETCONF applications - DEPRECATED: Use find_target_netconf_container() for efficiency"""
+        self.logger.warning("⚠️ find_netconf_containers() is deprecated for efficiency. Use find_target_netconf_container() instead.")
         containers = self.list_containers()
         netconf_containers = []
         
@@ -111,7 +275,7 @@ class DockerManager:
         """Get processes running inside a specific container"""
         try:
             # Use docker exec to run ps inside the container
-            ps_cmd = f"docker exec {container_id} ps aux"
+            ps_cmd = f"sudo docker exec {container_id} ps aux"
             exit_code, stdout, stderr = self.device.execute_command(ps_cmd)
             
             if exit_code != 0:
@@ -144,62 +308,95 @@ class DockerManager:
             return []
     
     def find_netconf_processes_in_container(self, container_id: str) -> List[ProcessInfo]:
-        """Find all NETCONF-related processes in a specific container"""
+        """Find all NETCONF-related processes in a container"""
         try:
-            self.logger.info(f"🔍 Searching for NETCONF processes in container {container_id}")
+            self.logger.info(f"🔍 Finding NETCONF processes in container {container_id}")
             
-            # Get all processes in container
-            ps_cmd = f"docker exec {container_id} ps aux"
-            exit_code, stdout, stderr = self.device.execute_command(ps_cmd)
+            # Enhanced NETCONF process patterns - be more comprehensive
+            netconf_patterns = [
+                "netconfd", "netconf-server", "confd", "sshd_netconf", 
+                "ietf-netconf", "yang-netconf", "restconf", "gnmi",
+                "sysrepod", "sysrepo", "netopeer2", "yanglint"
+            ]
+            
+            # Get all processes in container with sudo
+            ps_cmd = f"sudo docker exec {container_id} ps aux"
+            exit_code, stdout, stderr = self.device.execute_command(ps_cmd, timeout=15)
             
             if exit_code != 0:
                 self.logger.error(f"Failed to get process list from container: {stderr}")
                 return []
             
             netconf_processes = []
-            netconf_patterns = [
-                "netconfd", "confd", "sshd_netconf", "netconf-server",
-                "yang", "restconf", "gnmi", "netconf"
-            ]
+            lines = stdout.strip().split('\n')
             
-            self.logger.debug(f"Container {container_id} process list:\n{stdout}")
-            
-            for line in stdout.split('\n'):
-                line = line.strip()
-                if not line or line.startswith('USER'):  # Skip header
+            # Skip header line
+            for line in lines[1:]:
+                if not line.strip():
                     continue
                 
-                # Check if any NETCONF pattern matches
+                # Check if any NETCONF pattern matches - be more aggressive
                 line_lower = line.lower()
+                found_pattern = None
                 for pattern in netconf_patterns:
                     if pattern in line_lower and 'ps aux' not in line_lower:
-                        # Parse ps aux output: USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
-                        fields = line.split()
-                        if len(fields) >= 11:
-                            try:
-                                pid = int(fields[1])
-                                cpu_usage = float(fields[2])
-                                mem_percent = float(fields[3])
-                                command = ' '.join(fields[10:])
-                                
-                                # Estimate memory usage (rough calculation)
-                                memory_usage = int(mem_percent * 1024)  # Convert % to KB estimate
-                                
-                                process_info = ProcessInfo(
-                                    pid=pid,
-                                    name=pattern,
-                                    command=command,
-                                    memory_usage=memory_usage,
-                                    cpu_usage=cpu_usage
-                                )
-                                netconf_processes.append(process_info)
-                                self.logger.info(f"📋 Found NETCONF process: {pattern} (PID: {pid}) - {command}")
-                                break  # Don't match multiple patterns for same line
-                            except (ValueError, IndexError) as e:
-                                self.logger.debug(f"Failed to parse process line: {line} - {e}")
-                                continue
+                        found_pattern = pattern
+                        break
+                
+                if found_pattern:
+                    # Parse ps aux output: USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
+                    fields = line.split()
+                    if len(fields) >= 11:
+                        try:
+                            pid = int(fields[1])
+                            cpu_usage = float(fields[2])
+                            mem_percent = float(fields[3])
+                            command = ' '.join(fields[10:])
+                            
+                            # Estimate memory usage (rough calculation)
+                            memory_usage = int(mem_percent * 1024)  # Convert % to KB estimate
+                            
+                            process_info = ProcessInfo(
+                                pid=pid,
+                                name=found_pattern,
+                                command=command,
+                                memory_usage=memory_usage,
+                                cpu_usage=cpu_usage
+                            )
+                            netconf_processes.append(process_info)
+                            self.logger.info(f"📋 Found NETCONF process: {found_pattern} (PID: {pid}) - {command}")
+                        except (ValueError, IndexError) as e:
+                            self.logger.debug(f"Failed to parse process line: {line} - {e}")
+                            continue
             
-            self.logger.info(f"🎯 Found {len(netconf_processes)} NETCONF processes in container {container_id}")
+            # Also try to find processes by command name directly
+            self.logger.info("🔍 Double-checking with pgrep...")
+            for pattern in ["netconfd", "confd"]:
+                pgrep_cmd = f"sudo docker exec {container_id} pgrep -f {pattern}"
+                exit_code, stdout, stderr = self.device.execute_command(pgrep_cmd, timeout=10)
+                
+                if exit_code == 0 and stdout.strip():
+                    pids = [int(pid.strip()) for pid in stdout.split('\n') if pid.strip().isdigit()]
+                    for pid in pids:
+                        # Check if we already have this PID
+                        if not any(p.pid == pid for p in netconf_processes):
+                            # Get process details
+                            ps_detail_cmd = f"sudo docker exec {container_id} ps -p {pid} -o pid,pcpu,pmem,cmd --no-headers"
+                            exit_code, ps_output, _ = self.device.execute_command(ps_detail_cmd, timeout=5)
+                            if exit_code == 0 and ps_output.strip():
+                                fields = ps_output.strip().split(None, 3)
+                                if len(fields) >= 4:
+                                    process_info = ProcessInfo(
+                                        pid=pid,
+                                        name=pattern,
+                                        command=fields[3],
+                                        memory_usage=int(float(fields[2]) * 1024),
+                                        cpu_usage=float(fields[1])
+                                    )
+                                    netconf_processes.append(process_info)
+                                    self.logger.info(f"📋 Additional NETCONF process: {pattern} (PID: {pid}) - {fields[3]}")
+            
+            self.logger.info(f"🎯 Found {len(netconf_processes)} total NETCONF processes in container {container_id}")
             return netconf_processes
             
         except Exception as e:
@@ -207,50 +404,75 @@ class DockerManager:
             return []
 
     def kill_netconf_processes_in_container(self, container_id: str, signal: str = "TERM") -> bool:
-        """Kill all NETCONF processes in a container"""
+        """Kill ALL NETCONF processes in a container - comprehensive approach"""
         try:
-            # Find all NETCONF processes
+            self.logger.info(f"🛑 Killing ALL NETCONF processes in container {container_id}")
+            
+            # Method 1: Find and kill by PID
             netconf_processes = self.find_netconf_processes_in_container(container_id)
             
             if not netconf_processes:
                 self.logger.info(f"No NETCONF processes found in container {container_id}")
-                return True
-            
-            self.logger.info(f"🛑 Killing {len(netconf_processes)} NETCONF processes in container {container_id}")
-            
-            # Kill each process
-            killed_count = 0
-            for process in netconf_processes:
-                self.logger.info(f"Killing process PID {process.pid} ({process.name}): {process.command}")
+            else:
+                self.logger.info(f"🛑 Killing {len(netconf_processes)} NETCONF processes by PID")
                 
-                kill_cmd = f"docker exec {container_id} kill -{signal} {process.pid}"
-                exit_code, stdout, stderr = self.device.execute_command(kill_cmd)
+                # Kill each process
+                for process in netconf_processes:
+                    self.logger.info(f"Killing process PID {process.pid} ({process.name}): {process.command}")
+                    
+                    kill_cmd = f"sudo docker exec {container_id} kill -{signal} {process.pid}"
+                    exit_code, stdout, stderr = self.device.execute_command(kill_cmd, timeout=10)
+                    
+                    if exit_code == 0:
+                        self.logger.info(f"✅ Successfully sent {signal} signal to PID {process.pid}")
+                    else:
+                        self.logger.warning(f"⚠️ Failed to kill PID {process.pid}: {stderr}")
+            
+            # Method 2: Kill by process name patterns - more comprehensive
+            self.logger.info("🛑 Killing processes by name patterns...")
+            kill_patterns = ["netconfd", "confd", "netconf-server"]
+            
+            for pattern in kill_patterns:
+                # Try pkill first
+                pkill_cmd = f"sudo docker exec {container_id} pkill -{signal} -f {pattern}"
+                exit_code, stdout, stderr = self.device.execute_command(pkill_cmd, timeout=10)
                 
                 if exit_code == 0:
-                    self.logger.info(f"✅ Successfully sent {signal} signal to PID {process.pid}")
-                    killed_count += 1
-                else:
-                    self.logger.warning(f"⚠️ Failed to kill PID {process.pid}: {stderr}")
+                    self.logger.info(f"✅ pkill successful for pattern: {pattern}")
+                elif "no process found" not in stderr.lower():
+                    self.logger.debug(f"pkill for {pattern}: {stderr}")
+                
+                # Also try killall as backup
+                killall_cmd = f"sudo docker exec {container_id} killall -{signal} {pattern} 2>/dev/null || true"
+                self.device.execute_command(killall_cmd, timeout=5)
             
             # Wait for processes to terminate
             self.logger.info("⏱️ Waiting for processes to terminate...")
-            time.sleep(3)
+            time.sleep(5)
             
-            # Check if any processes are still running
+            # Method 3: Check if any processes are still running and force kill
             remaining_processes = self.find_netconf_processes_in_container(container_id)
             if remaining_processes and signal == "TERM":
-                self.logger.warning(f"⚠️ {len(remaining_processes)} processes still running, trying KILL signal")
-                # Force kill with KILL signal
+                self.logger.warning(f"⚠️ {len(remaining_processes)} processes still running, using KILL signal")
+                
+                # Force kill remaining processes
                 for process in remaining_processes:
-                    kill_cmd = f"docker exec {container_id} kill -KILL {process.pid}"
-                    exit_code, stdout, stderr = self.device.execute_command(kill_cmd)
+                    kill_cmd = f"sudo docker exec {container_id} kill -KILL {process.pid}"
+                    exit_code, stdout, stderr = self.device.execute_command(kill_cmd, timeout=5)
                     if exit_code == 0:
                         self.logger.info(f"🔪 Force killed PID {process.pid}")
                 
-                time.sleep(2)
+                # Also force kill by name
+                for pattern in kill_patterns:
+                    force_kill_cmd = f"sudo docker exec {container_id} pkill -KILL -f {pattern} 2>/dev/null || true"
+                    self.device.execute_command(force_kill_cmd, timeout=5)
+                
+                time.sleep(3)
                 final_check = self.find_netconf_processes_in_container(container_id)
                 if final_check:
-                    self.logger.error(f"❌ {len(final_check)} processes still running after KILL signal")
+                    self.logger.error(f"❌ {len(final_check)} processes still running after KILL signal:")
+                    for proc in final_check:
+                        self.logger.error(f"   PID {proc.pid}: {proc.command}")
                     return False
             
             self.logger.info(f"✅ Successfully killed all NETCONF processes in container {container_id}")
@@ -265,23 +487,45 @@ class DockerManager:
                                                 netconfd_command: str = "/usr/bin/netconfd --foreground",
                                                 valgrind_options: Dict[str, str] = None,
                                                 working_dir: str = None) -> Tuple[bool, int]:
-        """Start netconfd with Valgrind in container (fresh start, not attach)"""
+        """Start netconfd with Valgrind in container - kills ALL existing processes first"""
         try:
             self.logger.info(f"🎯 Starting netconfd with Valgrind in container {container_id}")
             
-            # Step 1: Kill any existing NETCONF processes
-            self.logger.info("🛑 Step 1: Killing existing NETCONF processes...")
-            if not self.kill_netconf_processes_in_container(container_id):
-                self.logger.error("Failed to kill existing NETCONF processes")
-                return False, -1
+            # Step 1: Kill ALL existing NETCONF processes aggressively
+            self.logger.info("🛑 Step 1: Aggressively killing ALL existing NETCONF processes...")
+            
+            # Multiple attempts to ensure clean slate
+            for attempt in range(3):
+                self.logger.info(f"   Attempt {attempt + 1}/3 to kill processes...")
+                
+                if not self.kill_netconf_processes_in_container(container_id, "TERM"):
+                    self.logger.warning(f"   Attempt {attempt + 1} - Some processes might still be running")
+                
+                # Wait and check
+                time.sleep(2)
+                remaining = self.find_netconf_processes_in_container(container_id)
+                if not remaining:
+                    self.logger.info("   ✅ All NETCONF processes successfully killed")
+                    break
+                else:
+                    self.logger.warning(f"   ⚠️ {len(remaining)} processes still running")
+                    if attempt == 2:  # Last attempt
+                        self.logger.error("   ❌ Failed to kill all processes after 3 attempts")
+                        return False, -1
             
             # Step 2: Verify Valgrind is available
             self.logger.info("🔍 Step 2: Verifying Valgrind availability...")
-            if not self.verify_valgrind_in_container(container_id):
-                self.logger.error("Valgrind not available in container")
+            valgrind_check_cmd = f"sudo docker exec {container_id} which valgrind"
+            exit_code, stdout, stderr = self.device.execute_command(valgrind_check_cmd, timeout=10)
+            
+            if exit_code != 0:
+                self.logger.error("❌ Valgrind not available in container")
                 return False, -1
             
-            # Step 3: Prepare Valgrind command
+            valgrind_path = stdout.strip()
+            self.logger.info(f"✅ Valgrind found at: {valgrind_path}")
+            
+            # Step 3: Prepare Valgrind command properly
             self.logger.info("⚙️ Step 3: Preparing Valgrind command...")
             default_valgrind_opts = {
                 "tool": "memcheck",
@@ -292,33 +536,37 @@ class DockerManager:
                 "xml-file": "/tmp/valgrind_netconfd_%p.xml",
                 "gen-suppressions": "all",
                 "child-silent-after-fork": "yes",
-                "trace-children": "yes"
+                "trace-children": "yes",
+                "verbose": ""
             }
             
             if valgrind_options:
                 default_valgrind_opts.update(valgrind_options)
             
-            # Build Valgrind command
-            valgrind_cmd_parts = ["valgrind"]
+            # Build Valgrind command parts
+            valgrind_cmd_parts = [valgrind_path]
             for option, value in default_valgrind_opts.items():
                 if value == "":
                     valgrind_cmd_parts.append(f"--{option}")
                 else:
                     valgrind_cmd_parts.append(f"--{option}={value}")
             
-            # Add the netconfd command
+            # IMPORTANT: Add the netconfd command AFTER all Valgrind options
             valgrind_cmd_parts.append(netconfd_command)
             valgrind_cmd = " ".join(valgrind_cmd_parts)
             
+            self.logger.info(f"🔧 Valgrind command: {valgrind_cmd}")
+            
             # Step 4: Start netconfd with Valgrind in background
             self.logger.info(f"🚀 Step 4: Starting netconfd with Valgrind...")
-            self.logger.info(f"Command: {valgrind_cmd}")
             
-            # Use docker exec with detached mode
+            # Construct full docker command with sudo
             if working_dir:
-                docker_cmd = f"docker exec -d -w {working_dir} {container_id} sh -c '{valgrind_cmd}'"
+                docker_cmd = f"sudo docker exec -d -w {working_dir} {container_id} sh -c '{valgrind_cmd}'"
             else:
-                docker_cmd = f"docker exec -d {container_id} sh -c '{valgrind_cmd}'"
+                docker_cmd = f"sudo docker exec -d {container_id} sh -c '{valgrind_cmd}'"
+            
+            self.logger.info(f"🐳 Docker command: {docker_cmd}")
             
             exit_code, stdout, stderr = self.device.execute_command(docker_cmd, timeout=30)
             
@@ -326,27 +574,28 @@ class DockerManager:
                 self.logger.info("✅ Valgrind + netconfd started successfully")
                 
                 # Step 5: Find the new process PID
-                self.logger.info("🔍 Step 5: Finding new netconfd PID...")
-                time.sleep(3)  # Wait for process to start
+                self.logger.info("🔍 Step 5: Finding new Valgrind process PID...")
+                time.sleep(5)  # Wait for process to start
                 
-                # Look for Valgrind process
-                ps_cmd = f"docker exec {container_id} ps aux | grep valgrind | grep -v grep"
-                exit_code, stdout, stderr = self.device.execute_command(ps_cmd)
+                # Look for Valgrind process with sudo
+                ps_cmd = f"sudo docker exec {container_id} ps aux | grep valgrind | grep -v grep"
+                exit_code, stdout, stderr = self.device.execute_command(ps_cmd, timeout=10)
                 
                 if exit_code == 0 and stdout.strip():
                     # Parse the PID from ps output
                     lines = stdout.strip().split('\n')
                     for line in lines:
                         fields = line.split()
-                        if len(fields) >= 2:
+                        if len(fields) >= 2 and 'netconfd' in line:
                             try:
                                 valgrind_pid = int(fields[1])
-                                self.logger.info(f"🎯 Found Valgrind process PID: {valgrind_pid}")
+                                self.logger.info(f"🎯 Found Valgrind+netconfd process PID: {valgrind_pid}")
                                 return True, valgrind_pid
                             except ValueError:
                                 continue
                 
-                # Fallback: look for netconfd process
+                # Fallback: look for any netconfd process
+                self.logger.info("🔍 Fallback: Looking for netconfd process...")
                 netconf_processes = self.find_netconf_processes_in_container(container_id)
                 if netconf_processes:
                     new_pid = netconf_processes[0].pid
@@ -356,38 +605,42 @@ class DockerManager:
                     self.logger.warning("⚠️ Process started but PID not found")
                     return True, -1
             else:
-                self.logger.error(f"❌ Failed to start netconfd with Valgrind: {stderr}")
+                self.logger.error(f"❌ Failed to start Valgrind + netconfd: {stderr}")
                 return False, -1
                 
         except Exception as e:
             self.logger.error(f"Error starting netconfd with Valgrind: {e}")
             return False, -1
 
-    def restart_netconfd_normally_in_container(self, 
-                                             container_id: str,
+    def restart_netconfd_normally_in_container(self, container_id: str, 
                                              netconfd_command: str = "/usr/bin/netconfd --foreground") -> bool:
-        """Restart netconfd normally (without Valgrind) in container"""
+        """Stop Valgrind+netconfd and restart netconfd normally"""
         try:
             self.logger.info(f"🔄 Restarting netconfd normally in container {container_id}")
             
-            # Kill any existing processes (including Valgrind)
-            self.kill_netconf_processes_in_container(container_id)
+            # Kill all existing processes (including Valgrind)
+            self.logger.info("🛑 Killing all existing NETCONF and Valgrind processes...")
             
-            # Also kill any valgrind processes
-            valgrind_kill_cmd = f"docker exec {container_id} pkill -f valgrind"
-            self.device.execute_command(valgrind_kill_cmd)
+            # Kill Valgrind processes specifically
+            valgrind_kill_cmd = f"sudo docker exec {container_id} pkill -KILL -f valgrind || true"
+            self.device.execute_command(valgrind_kill_cmd, timeout=10)
             
-            time.sleep(2)
+            # Kill all NETCONF processes
+            self.kill_netconf_processes_in_container(container_id, "KILL")
             
-            # Start netconfd normally
-            docker_cmd = f"docker exec -d {container_id} {netconfd_command}"
-            exit_code, stdout, stderr = self.device.execute_command(docker_cmd)
+            # Wait for cleanup
+            time.sleep(3)
+            
+            # Start netconfd normally in background
+            self.logger.info("🚀 Starting netconfd normally...")
+            normal_start_cmd = f"sudo docker exec -d {container_id} {netconfd_command}"
+            exit_code, stdout, stderr = self.device.execute_command(normal_start_cmd, timeout=15)
             
             if exit_code == 0:
                 self.logger.info("✅ netconfd restarted normally")
                 return True
             else:
-                self.logger.error(f"Failed to restart netconfd normally: {stderr}")
+                self.logger.error(f"❌ Failed to restart netconfd: {stderr}")
                 return False
                 
         except Exception as e:
@@ -407,7 +660,7 @@ class DockerManager:
             
             # Update container memory limit without stopping
             self.logger.info(f"Updating container memory limit to {memory_limit} (no restart required)...")
-            update_cmd = f"docker update --memory={memory_limit} --memory-swap={memory_limit} {container_id}"
+            update_cmd = f"sudo docker update --memory={memory_limit} --memory-swap={memory_limit} {container_id}"
             exit_code, stdout, stderr = self.device.execute_command(update_cmd)
             
             if exit_code != 0:
@@ -429,12 +682,12 @@ class DockerManager:
         try:
             # Build docker exec command
             exec_flags = "-it" if interactive else ""
-            docker_exec_cmd = f"docker exec {exec_flags} {container_id} {command}"
+            docker_exec_cmd = f"sudo docker exec {exec_flags} {container_id} {command}"
             
             return self.device.execute_command(docker_exec_cmd)
             
         except Exception as e:
-            self.logger.error(f"Failed to exec into container: {e}")
+            self.logger.error(f"Error executing command in container: {e}")
             return 1, "", str(e)
     
     def start_valgrind_in_container(self, container_id: str, target_pid: int, 
@@ -471,7 +724,7 @@ class DockerManager:
             valgrind_cmd = " ".join(valgrind_cmd_parts)
             
             # Execute in container
-            docker_cmd = f"docker exec -d {container_id} {valgrind_cmd}"
+            docker_cmd = f"sudo docker exec -d {container_id} {valgrind_cmd}"
             exit_code, stdout, stderr = self.device.execute_command(docker_cmd)
             
             if exit_code == 0:
@@ -491,7 +744,7 @@ class DockerManager:
             self.logger.info(f"Killing process PID {pid} in container {container_id} with signal {signal}")
             
             # Use docker exec to kill process
-            kill_cmd = f"docker exec {container_id} kill -{signal} {pid}"
+            kill_cmd = f"sudo docker exec {container_id} kill -{signal} {pid}"
             exit_code, stdout, stderr = self.device.execute_command(kill_cmd)
             
             if exit_code == 0:
@@ -516,7 +769,7 @@ class DockerManager:
     def is_process_running_in_container(self, container_id: str, pid: int) -> bool:
         """Check if a process is running inside a container"""
         try:
-            ps_cmd = f"docker exec {container_id} ps -p {pid}"
+            ps_cmd = f"sudo docker exec {container_id} ps -p {pid}"
             exit_code, stdout, stderr = self.device.execute_command(ps_cmd)
             return exit_code == 0 and str(pid) in stdout
         except Exception:
@@ -558,9 +811,9 @@ class DockerManager:
             # Prepare docker exec command
             docker_exec_flags = "-d" if background else "-it"
             if working_dir:
-                docker_cmd = f"docker exec {docker_exec_flags} -w {working_dir} {container_id} {valgrind_cmd}"
+                docker_cmd = f"sudo docker exec {docker_exec_flags} -w {working_dir} {container_id} {valgrind_cmd}"
             else:
-                docker_cmd = f"docker exec {docker_exec_flags} {container_id} {valgrind_cmd}"
+                docker_cmd = f"sudo docker exec {docker_exec_flags} {container_id} {valgrind_cmd}"
             
             self.logger.info(f"Starting process with Valgrind in container: {docker_cmd}")
             exit_code, stdout, stderr = self.device.execute_command(docker_cmd, timeout=60)
@@ -708,7 +961,7 @@ class DockerManager:
     def _get_container_config(self, container_id: str) -> Dict[str, Any]:
         """Get current container configuration"""
         try:
-            inspect_cmd = f"docker inspect {container_id}"
+            inspect_cmd = f"sudo docker inspect {container_id}"
             exit_code, stdout, stderr = self.device.execute_command(inspect_cmd)
             
             if exit_code == 0:
@@ -736,7 +989,7 @@ class DockerManager:
         while time.time() - start_time < timeout_seconds:
             try:
                 # Check if container is running
-                status_cmd = f"docker inspect {container_id} --format '{{{{.State.Status}}}}'"
+                status_cmd = f"sudo docker inspect {container_id} --format '{{{{.State.Status}}}}'"
                 exit_code, stdout, stderr = self.device.execute_command(status_cmd)
                 
                 if exit_code == 0 and stdout.strip() == "running":
@@ -765,3 +1018,110 @@ class DockerManager:
                 
         except Exception as e:
             return f"Failed to get logs: {e}" 
+
+    def start_netconfd_with_configurable_setup(self, 
+                                              container_id: str,
+                                              container_setup_config: Dict[str, Any],
+                                              template_vars: Dict[str, Any] = None) -> Tuple[bool, int]:
+        """Start netconfd using configurable container setup"""
+        try:
+            from .configurable_container_setup import ConfigurableContainerSetup, ContainerSetupConfig
+            
+            self.logger.info(f"🔧 Starting configurable container setup for {container_id}")
+            
+            # Parse container setup configuration
+            if 'container_setup' in container_setup_config:
+                setup_dict = container_setup_config['container_setup']
+            else:
+                # Fallback to default if no container_setup specified
+                setup_dict = {
+                    'pre_commands': [],
+                    'file_edits': [],
+                    'valgrind_command': 'valgrind --tool=memcheck --leak-check=full --xml=yes --xml-file=/tmp/valgrind_%p.xml /usr/bin/netconfd --foreground',
+                    'post_commands': [],
+                    'cleanup_commands': []
+                }
+            
+            setup_config = ConfigurableContainerSetup.parse_container_setup_config(setup_dict)
+            
+            # Create configurable setup manager
+            configurable_setup = ConfigurableContainerSetup(self.device)
+            
+            # Set template variables
+            if template_vars:
+                configurable_setup.set_template_variables(**template_vars)
+            
+            # Kill existing NETCONF processes first
+            self.logger.info("🛑 Killing existing NETCONF processes...")
+            self.kill_netconf_processes_in_container(container_id, "TERM")
+            
+            # Execute configurable setup
+            success = configurable_setup.execute_container_setup(container_id, setup_config)
+            
+            if success:
+                # Try to find the Valgrind process PID
+                time.sleep(3)
+                ps_cmd = f"sudo docker exec {container_id} ps aux | grep valgrind | grep -v grep"
+                exit_code, stdout, stderr = self.device.execute_command(ps_cmd, timeout=10)
+                
+                valgrind_pid = -1
+                if exit_code == 0 and stdout.strip():
+                    lines = stdout.strip().split('\n')
+                    for line in lines:
+                        fields = line.split()
+                        if len(fields) >= 2 and 'netconfd' in line:
+                            try:
+                                valgrind_pid = int(fields[1])
+                                break
+                            except ValueError:
+                                continue
+                
+                self.logger.info(f"✅ Configurable container setup completed, Valgrind PID: {valgrind_pid}")
+                return True, valgrind_pid
+            else:
+                self.logger.error("❌ Configurable container setup failed")
+                return False, -1
+                
+        except ImportError:
+            self.logger.error("❌ ConfigurableContainerSetup not available")
+            return False, -1
+        except Exception as e:
+            self.logger.error(f"❌ Error in configurable container setup: {e}")
+            return False, -1
+    
+    def cleanup_configurable_container(self, 
+                                     container_id: str, 
+                                     cleanup_commands: List[str],
+                                     template_vars: Dict[str, Any] = None) -> bool:
+        """Execute cleanup commands from configurable setup"""
+        try:
+            from .configurable_container_setup import ConfigurableContainerSetup
+            
+            if not cleanup_commands:
+                return True
+            
+            self.logger.info(f"🧹 Running configurable cleanup for {container_id}")
+            
+            # Create configurable setup manager
+            configurable_setup = ConfigurableContainerSetup(self.device)
+            
+            # Set template variables
+            if template_vars:
+                configurable_setup.set_template_variables(**template_vars)
+            
+            # Execute cleanup commands
+            success = configurable_setup.execute_cleanup_commands(container_id, cleanup_commands)
+            
+            if success:
+                self.logger.info("✅ Configurable cleanup completed")
+            else:
+                self.logger.warning("⚠️ Some cleanup commands failed")
+            
+            return success
+            
+        except ImportError:
+            self.logger.warning("ConfigurableContainerSetup not available for cleanup")
+            return True
+        except Exception as e:
+            self.logger.error(f"Error in configurable cleanup: {e}")
+            return False 

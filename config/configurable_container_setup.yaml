@@ -1,0 +1,138 @@
+# Configurable Container Setup Example
+# Flexible configuration for complex container preparation
+
+devices:
+  production_device:
+    connection:
+      hostname: "192.168.1.100"
+      port: 22
+      username: "admin"
+      password: "admin123"
+      use_diag_shell: true
+      use_sudo_docker: true
+      diag_command: "diag shell host"
+    
+    test_scenarios:
+      - name: "netconf_ui_complex_setup"
+        container_id: "netconf-ui"
+        memory_limit: "5g"
+        profiler: "valgrind"
+        profiling_duration: 120
+        
+        # Custom container setup sequence
+        container_setup:
+          # Commands to run BEFORE starting Valgrind
+          pre_commands:
+            - "apt-get update"
+            - "apt-get install -y gdb"
+            - "systemctl stop apache2"
+            - "pkill -f old_service"
+            - "mkdir -p /var/log/valgrind"
+            - "chmod 755 /var/log/valgrind"
+          
+          # Files to edit inside the container
+          file_edits:
+            - file: "/etc/netconf/netconf.conf"
+              backup: true
+              backup_suffix: ".backup"
+              content: |
+                # Modified for Valgrind testing
+                debug_level = 3
+                memory_tracking = enabled
+                log_file = /var/log/netconf/debug.log
+                
+            - file: "/usr/local/bin/netconf_wrapper.sh"
+              backup: false
+              content: |
+                #!/bin/bash
+                export MALLOC_CHECK_=1
+                export MALLOC_PERTURB_=42
+                exec "$@"
+              permissions: "755"
+          
+          # Custom Valgrind command (uses template variables)
+          valgrind_command: >
+            valgrind 
+            --tool=memcheck 
+            --leak-check=full 
+            --show-leak-kinds=all 
+            --track-origins=yes 
+            --xml=yes 
+            --xml-file=/var/log/valgrind/netconf_{{container_id}}_{{timestamp}}.xml
+            --gen-suppressions=all
+            --child-silent-after-fork=yes
+            --trace-children=yes
+            --log-file=/var/log/valgrind/valgrind_{{container_id}}.log
+            /usr/local/bin/netconf_wrapper.sh /usr/bin/netconfd --foreground --config=/etc/netconf/netconf.conf
+          
+          # Commands to run AFTER starting Valgrind (optional)
+          post_commands:
+            - "echo 'Valgrind started successfully' >> /var/log/setup.log"
+            - "systemctl status netconfd || true"
+          
+          # Cleanup commands (run when stopping)
+          cleanup_commands:
+            - "systemctl start apache2"
+            - "rm -f /tmp/valgrind_*"
+        
+        # RPC testing configuration
+        rpc_testing:
+          rpc_count: 50
+          rpc_interval: 1.0
+          stress_mode: true
+        
+        output:
+          session_name: "production_test"
+          output_dir: "results/production"
+          auto_analyze: true
+          generate_reports: true
+
+  simple_device:
+    connection:
+      hostname: "192.168.1.101"
+      port: 22
+      username: "admin"
+      password: "admin123"
+    
+    test_scenarios:
+      - name: "basic_netconf_test"
+        container_id: "netconf-basic"
+        memory_limit: "3g"
+        profiler: "valgrind"
+        profiling_duration: 60
+        
+        # Simple setup - just use default behavior
+        container_setup:
+          # Optional: Override just the Valgrind command
+          valgrind_command: >
+            valgrind --tool=memcheck --leak-check=full 
+            --xml=yes --xml-file=/tmp/simple_valgrind_{{timestamp}}.xml
+            /usr/bin/netconfd --foreground
+        
+        output:
+          session_name: "simple_test"
+          output_dir: "results/simple"
+
+global_config:
+  max_parallel_devices: 2
+  log_level: "INFO"
+  
+  # Default container setup (used if not specified in scenario)
+  default_container_setup:
+    pre_commands: []
+    file_edits: []
+    valgrind_command: >
+      valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all 
+      --track-origins=yes --xml=yes --xml-file=/tmp/valgrind_{{container_id}}_%p.xml
+      --gen-suppressions=all --child-silent-after-fork=yes --trace-children=yes
+      /usr/bin/netconfd --foreground
+    post_commands: []
+    cleanup_commands: []
+  
+  # Template variables available:
+  # {{container_id}} - Container ID
+  # {{timestamp}} - Current timestamp
+  # {{session_id}} - Test session ID
+  # {{scenario_name}} - Scenario name
+  # {{memory_limit}} - Memory limit
+  # {{device_hostname}} - Device hostname 
