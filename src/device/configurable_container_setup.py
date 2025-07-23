@@ -1,50 +1,247 @@
+#!/usr/bin/env python3
 """
-Configurable Container Setup Manager
-Handles flexible container preparation with custom commands and file editing
+Configurable Container Setup
+Handles custom container preparation with environment-preserving single-session execution
 """
 
-import time
 import logging
+import time
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-from datetime import datetime
 
 from .device_connector import DeviceConnector
 
 @dataclass
 class FileEdit:
-    """Configuration for editing a file inside container"""
+    """File editing configuration"""
     file: str
     content: str
-    backup: bool = True
-    backup_suffix: str = ".backup"
+    backup: bool = False
     permissions: Optional[str] = None
 
 @dataclass
 class ContainerSetupConfig:
-    """Configuration for container setup sequence"""
-    pre_commands: List[str]
-    file_edits: List[FileEdit]
-    valgrind_command: str
-    post_commands: List[str]
-    cleanup_commands: List[str]
+    """Container setup configuration"""
+    pre_commands: List[str] = None
+    file_edits: List[FileEdit] = None
+    valgrind_command: str = ""
+    post_commands: List[str] = None
+    cleanup_commands: List[str] = None
+    working_dir: Optional[str] = None
+    use_single_session: bool = True  # NEW: Enable single session by default
 
 class ConfigurableContainerSetup:
-    """Manages configurable container setup with custom commands and file editing"""
+    """Configurable container setup with custom commands and file editing"""
     
-    def __init__(self, device_connector: DeviceConnector):
+    def __init__(self, device_connector):
         self.device = device_connector
         self.logger = logging.getLogger(__name__)
         self.template_vars = {}
     
-    def set_template_variables(self, **kwargs):
+    def set_template_variables(self, variables: Dict[str, str]):
         """Set template variables for command substitution"""
-        self.template_vars.update(kwargs)
-        # Add timestamp if not provided
-        if 'timestamp' not in self.template_vars:
-            self.template_vars['timestamp'] = int(time.time())
+        self.template_vars = variables
+    
+    def execute_container_setup(self, container_id: str, config: ContainerSetupConfig) -> bool:
+        """Execute container setup using single session bash script"""
+        
+        try:
+            self.logger.info(f"🔧 Starting configurable container setup for {container_id}")
+            
+            # Check if we should use single session mode (recommended)
+            if getattr(config, 'use_single_session', True):
+                return self._execute_single_session_setup(container_id, config)
+            else:
+                # Fallback to original multi-session approach
+                return self._execute_multi_session_setup(container_id, config)
+                
+        except Exception as e:
+            self.logger.error(f"Container setup failed: {e}")
+            return False
+    
+    def _execute_single_session_setup(self, container_id: str, config: ContainerSetupConfig) -> bool:
+        """Execute all commands in a single bash session to preserve environment variables"""
+        
+        # Build list of all commands
+        all_commands = []
+        
+        # Add pre-commands
+        if config.pre_commands:
+            self.logger.info(f"📋 Adding {len(config.pre_commands)} pre-commands")
+            all_commands.extend(config.pre_commands)
+        
+        # Add Valgrind command if specified
+        if config.valgrind_command:
+            self.logger.info("🚀 Adding Valgrind command")
+            # Add background execution for Valgrind
+            valgrind_cmd = config.valgrind_command
+            if not valgrind_cmd.endswith('&'):
+                valgrind_cmd += ' &'
+            all_commands.append(valgrind_cmd)
+            all_commands.append('sleep 3')  # Wait for Valgrind to start
+            all_commands.append('ps aux | grep valgrind | grep -v grep || echo "Valgrind not found"')  # Verify
+        
+        # Add post-commands
+        if config.post_commands:
+            self.logger.info(f"📋 Adding {len(config.post_commands)} post-commands")
+            all_commands.extend(config.post_commands)
+        
+        # Handle file edits separately (they need docker cp)
+        if config.file_edits:
+            self.logger.info("📝 Processing file edits...")
+            for file_edit in config.file_edits:
+                if not self._edit_file(container_id, file_edit):
+                    return False
+        
+        # Execute all commands in single session if we have any
+        if all_commands:
+            return self._execute_commands_as_script(container_id, all_commands, config.working_dir)
+        else:
+            self.logger.info("✅ No commands to execute")
+            return True
+    
+    def _execute_commands_as_script(self, container_id: str, commands: List[str], working_dir: Optional[str] = None) -> bool:
+        """Generate and execute a bash script from command list"""
+        
+        try:
+            # Generate bash script content
+            script_content = self._generate_bash_script(commands, working_dir)
+            
+            # Create temporary script file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as tmp_file:
+                tmp_file.write(script_content)
+                tmp_script_path = tmp_file.name
+            
+            try:
+                # Copy script to container
+                copy_cmd = f"sudo docker cp {tmp_script_path} {container_id}:/tmp/setup_script.sh"
+                exit_code, stdout, stderr = self.device.execute_command(copy_cmd, timeout=30)
+                
+                if exit_code != 0:
+                    self.logger.error(f"Failed to copy script to container: {stderr}")
+                    return False
+                
+                # Execute script in container (single session preserves environment)
+                exec_cmd = f"sudo docker exec {container_id} bash -c 'chmod +x /tmp/setup_script.sh && /tmp/setup_script.sh'"
+                
+                self.logger.info(f"🚀 Executing {len(commands)} commands in single container session...")
+                
+                # Execute with extended timeout
+                total_timeout = len(commands) * 30 + 120  # 30s per command + 2min buffer
+                exit_code, stdout, stderr = self.device.execute_command(exec_cmd, timeout=total_timeout)
+                
+                # Log the output
+                if stdout:
+                    self.logger.info("📋 Script output:")
+                    for line in stdout.split('\n'):
+                        if line.strip():
+                            self.logger.info(f"   {line}")
+                
+                if exit_code == 0:
+                    self.logger.info("✅ Single session script execution completed successfully")
+                else:
+                    self.logger.error(f"❌ Script execution failed: {stderr}")
+                
+                # Clean up script from container
+                cleanup_cmd = f"sudo docker exec {container_id} rm -f /tmp/setup_script.sh"
+                self.device.execute_command(cleanup_cmd, timeout=10)
+                
+                return exit_code == 0
+                
+            finally:
+                # Clean up local temporary file
+                Path(tmp_script_path).unlink(missing_ok=True)
+                
+        except Exception as e:
+            self.logger.error(f"Error executing commands as script: {e}")
+            return False
+    
+    def _generate_bash_script(self, commands: List[str], working_dir: Optional[str] = None) -> str:
+        """Generate bash script content from command list"""
+        
+        script_lines = [
+            "#!/bin/bash",
+            "set -e  # Exit on any error",
+            "",
+            "echo '=== Starting Single Session Container Setup ==='",
+            "echo 'Session PID: $$'",
+            "echo 'Environment variables will persist across all commands'",
+            ""
+        ]
+        
+        # Add working directory change if specified
+        if working_dir:
+            script_lines.append(f"cd {working_dir}")
+            script_lines.append(f"echo 'Changed to working directory: {working_dir}'")
+            script_lines.append("")
+        
+        # Add each command with logging
+        for i, command in enumerate(commands):
+            # Substitute template variables
+            final_command = self._substitute_template(command)
+            
+            script_lines.extend([
+                f"# Command {i+1}",
+                f"echo '--- Executing Command {i+1}: {final_command[:50]}{'...' if len(final_command) > 50 else ''} ---'",
+                final_command,
+                "echo '✅ Command completed'",
+                ""
+            ])
+        
+        script_lines.append("echo '=== Single Session Setup Complete ==='")
+        
+        return "\n".join(script_lines)
+    
+    def _edit_file(self, container_id: str, file_edit: FileEdit) -> bool:
+        """Edit a single file"""
+        
+        try:
+            # Substitute template variables in content
+            file_content = self._substitute_template(file_edit.content)
+            file_path = self._substitute_template(file_edit.file)
+            
+            self.logger.info(f"      📝 Editing {file_path}")
+            
+            # Create backup if requested
+            if file_edit.backup:
+                backup_cmd = f"sudo docker exec {container_id} cp {file_path} {file_path}.backup_{int(time.time())}"
+                exit_code, stdout, stderr = self.device.execute_command(backup_cmd, timeout=10)
+                if exit_code == 0:
+                    self.logger.debug(f"      💾 Backup created for {file_path}")
+            
+            # Create temporary file with content
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp') as tmp_file:
+                tmp_file.write(file_content)
+                tmp_file_path = tmp_file.name
+            
+            try:
+                # Copy content to container
+                copy_cmd = f"sudo docker cp {tmp_file_path} {container_id}:{file_path}"
+                exit_code, stdout, stderr = self.device.execute_command(copy_cmd, timeout=30)
+                
+                if exit_code == 0:
+                    self.logger.info(f"      ✅ File {file_path} updated successfully")
+                    
+                    # Set permissions if specified
+                    if file_edit.permissions:
+                        perm_cmd = f"sudo docker exec {container_id} chmod {file_edit.permissions} {file_path}"
+                        self.device.execute_command(perm_cmd, timeout=10)
+                        self.logger.debug(f"      🔒 Permissions set to {file_edit.permissions}")
+                    
+                    return True
+                else:
+                    self.logger.error(f"      ❌ Failed to update {file_path}: {stderr}")
+                    return False
+                    
+            finally:
+                # Clean up temporary file
+                Path(tmp_file_path).unlink(missing_ok=True)
+                
+        except Exception as e:
+            self.logger.error(f"Error editing file {file_edit.file}: {e}")
+            return False
     
     def _substitute_template(self, text: str) -> str:
         """Substitute template variables in text"""
@@ -54,115 +251,55 @@ class ConfigurableContainerSetup:
             result = result.replace(placeholder, str(value))
         return result
     
-    def execute_container_setup(self, container_id: str, setup_config: ContainerSetupConfig) -> bool:
-        """Execute the complete container setup sequence"""
-        try:
-            self.logger.info(f"🔧 Starting configurable container setup for {container_id}")
-            
-            # Set container_id in template vars
-            self.set_template_variables(container_id=container_id)
-            
-            # Step 1: Execute pre-commands
-            if setup_config.pre_commands:
-                if not self._execute_pre_commands(container_id, setup_config.pre_commands):
-                    return False
-            
-            # Step 2: Edit files
-            if setup_config.file_edits:
-                if not self._edit_files(container_id, setup_config.file_edits):
-                    return False
-            
-            # Step 3: Start Valgrind with custom command
-            if not self._start_valgrind_with_config(container_id, setup_config.valgrind_command):
-                return False
-            
-            # Step 4: Execute post-commands
-            if setup_config.post_commands:
-                if not self._execute_post_commands(container_id, setup_config.post_commands):
-                    self.logger.warning("Post-commands failed, but Valgrind is running")
-            
-            self.logger.info(f"✅ Container setup completed for {container_id}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"❌ Container setup failed for {container_id}: {e}")
+    def _execute_multi_session_setup(self, container_id: str, config: ContainerSetupConfig) -> bool:
+        """Execute setup using multiple sessions (original approach)"""
+        
+        self.logger.warning("⚠️ Using multi-session mode - environment variables won't persist between commands")
+        
+        # Execute pre-commands
+        if config.pre_commands and not self._execute_pre_commands(container_id, config.pre_commands):
             return False
-    
+        
+        # Edit files
+        if config.file_edits and not self._edit_files(container_id, config.file_edits):
+            return False
+        
+        # Start Valgrind
+        if config.valgrind_command and not self._start_valgrind_with_config(container_id, config.valgrind_command):
+            return False
+        
+        # Execute post-commands
+        if config.post_commands and not self._execute_post_commands(container_id, config.post_commands):
+            return False
+        
+        return True
+
+    # Keep existing methods for backward compatibility
     def _execute_pre_commands(self, container_id: str, pre_commands: List[str]) -> bool:
         """Execute pre-setup commands"""
         self.logger.info(f"🚀 Executing {len(pre_commands)} pre-commands...")
         
-        for i, command in enumerate(pre_commands, 1):
-            try:
-                # Substitute template variables
-                final_command = self._substitute_template(command)
-                
-                self.logger.info(f"   [{i}/{len(pre_commands)}] {final_command}")
-                
-                # Execute command in container
-                docker_cmd = f"sudo docker exec {container_id} sh -c '{final_command}'"
-                exit_code, stdout, stderr = self.device.execute_command(docker_cmd, timeout=60)
-                
-                if exit_code == 0:
-                    self.logger.info(f"      ✅ Command {i} completed successfully")
-                    if stdout.strip():
-                        self.logger.debug(f"      Output: {stdout.strip()}")
-                else:
-                    self.logger.error(f"      ❌ Command {i} failed: {stderr}")
-                    return False
-                    
-            except Exception as e:
-                self.logger.error(f"Error executing pre-command {i}: {e}")
+        for i, command in enumerate(pre_commands):
+            final_command = self._substitute_template(command)
+            self.logger.info(f"   Command {i+1}: {final_command}")
+            
+            docker_cmd = f"sudo docker exec {container_id} sh -c '{final_command}'"
+            exit_code, stdout, stderr = self.device.execute_command(docker_cmd, timeout=60)
+            
+            if exit_code == 0:
+                self.logger.info(f"   ✅ Pre-command {i+1} completed")
+            else:
+                self.logger.error(f"   ❌ Pre-command {i+1} failed: {stderr}")
                 return False
         
         return True
     
     def _edit_files(self, container_id: str, file_edits: List[FileEdit]) -> bool:
-        """Edit files inside the container"""
+        """Edit multiple files"""
         self.logger.info(f"📝 Editing {len(file_edits)} files...")
         
-        for i, file_edit in enumerate(file_edits, 1):
-            try:
-                file_path = self._substitute_template(file_edit.file)
-                file_content = self._substitute_template(file_edit.content)
-                
-                self.logger.info(f"   [{i}/{len(file_edits)}] Editing {file_path}")
-                
-                # Create backup if requested
-                if file_edit.backup:
-                    backup_path = f"{file_path}{file_edit.backup_suffix}"
-                    backup_cmd = f"sudo docker exec {container_id} cp {file_path} {backup_path} 2>/dev/null || true"
-                    self.device.execute_command(backup_cmd, timeout=10)
-                    self.logger.debug(f"      📋 Backup created: {backup_path}")
-                
-                # Create temporary file with content
-                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.tmp') as tmp_file:
-                    tmp_file.write(file_content)
-                    tmp_file_path = tmp_file.name
-                
-                try:
-                    # Copy content to container
-                    copy_cmd = f"sudo docker cp {tmp_file_path} {container_id}:{file_path}"
-                    exit_code, stdout, stderr = self.device.execute_command(copy_cmd, timeout=30)
-                    
-                    if exit_code == 0:
-                        self.logger.info(f"      ✅ File {file_path} updated successfully")
-                        
-                        # Set permissions if specified
-                        if file_edit.permissions:
-                            perm_cmd = f"sudo docker exec {container_id} chmod {file_edit.permissions} {file_path}"
-                            self.device.execute_command(perm_cmd, timeout=10)
-                            self.logger.debug(f"      🔒 Permissions set to {file_edit.permissions}")
-                    else:
-                        self.logger.error(f"      ❌ Failed to update {file_path}: {stderr}")
-                        return False
-                        
-                finally:
-                    # Clean up temporary file
-                    Path(tmp_file_path).unlink(missing_ok=True)
-                    
-            except Exception as e:
-                self.logger.error(f"Error editing file {i}: {e}")
+        for i, file_edit in enumerate(file_edits):
+            if not self._edit_file(container_id, file_edit):
                 return False
         
         return True
@@ -204,62 +341,42 @@ class ConfigurableContainerSetup:
     
     def _execute_post_commands(self, container_id: str, post_commands: List[str]) -> bool:
         """Execute post-setup commands"""
-        self.logger.info(f"📋 Executing {len(post_commands)} post-commands...")
+        self.logger.info(f"🔄 Executing {len(post_commands)} post-commands...")
         
-        for i, command in enumerate(post_commands, 1):
-            try:
-                # Substitute template variables
-                final_command = self._substitute_template(command)
-                
-                self.logger.info(f"   [{i}/{len(post_commands)}] {final_command}")
-                
-                # Execute command in container
-                docker_cmd = f"sudo docker exec {container_id} sh -c '{final_command}'"
-                exit_code, stdout, stderr = self.device.execute_command(docker_cmd, timeout=30)
-                
-                if exit_code == 0:
-                    self.logger.info(f"      ✅ Post-command {i} completed")
-                    if stdout.strip():
-                        self.logger.debug(f"      Output: {stdout.strip()}")
-                else:
-                    self.logger.warning(f"      ⚠️ Post-command {i} failed: {stderr}")
-                    # Continue with other commands even if one fails
-                    
-            except Exception as e:
-                self.logger.warning(f"Error executing post-command {i}: {e}")
-                # Continue with other commands
+        for i, command in enumerate(post_commands):
+            final_command = self._substitute_template(command)
+            self.logger.info(f"   Command {i+1}: {final_command}")
+            
+            docker_cmd = f"sudo docker exec {container_id} sh -c '{final_command}'"
+            exit_code, stdout, stderr = self.device.execute_command(docker_cmd, timeout=60)
+            
+            if exit_code == 0:
+                self.logger.info(f"   ✅ Post-command {i+1} completed")
+            else:
+                self.logger.warning(f"   ⚠️ Post-command {i+1} failed: {stderr}")
+                # Don't return False for post-commands, just warn
         
         return True
     
-    def execute_cleanup_commands(self, container_id: str, cleanup_commands: List[str]) -> bool:
-        """Execute cleanup commands when stopping"""
+    def execute_cleanup_commands(self, container_id: str, cleanup_commands: List[str], template_vars: Dict[str, str]):
+        """Execute cleanup commands"""
         if not cleanup_commands:
-            return True
-            
+            return
+        
+        self.set_template_variables(template_vars)
         self.logger.info(f"🧹 Executing {len(cleanup_commands)} cleanup commands...")
         
-        for i, command in enumerate(cleanup_commands, 1):
-            try:
-                # Substitute template variables
-                final_command = self._substitute_template(command)
-                
-                self.logger.info(f"   [{i}/{len(cleanup_commands)}] {final_command}")
-                
-                # Execute command in container
-                docker_cmd = f"sudo docker exec {container_id} sh -c '{final_command}'"
-                exit_code, stdout, stderr = self.device.execute_command(docker_cmd, timeout=30)
-                
-                if exit_code == 0:
-                    self.logger.info(f"      ✅ Cleanup command {i} completed")
-                else:
-                    self.logger.warning(f"      ⚠️ Cleanup command {i} failed: {stderr}")
-                    # Continue with other cleanup commands
-                    
-            except Exception as e:
-                self.logger.warning(f"Error executing cleanup command {i}: {e}")
-                # Continue with other commands
-        
-        return True
+        for i, command in enumerate(cleanup_commands):
+            final_command = self._substitute_template(command)
+            self.logger.info(f"   Cleanup {i+1}: {final_command}")
+            
+            docker_cmd = f"sudo docker exec {container_id} sh -c '{final_command}'"
+            exit_code, stdout, stderr = self.device.execute_command(docker_cmd, timeout=60)
+            
+            if exit_code == 0:
+                self.logger.info(f"   ✅ Cleanup {i+1} completed")
+            else:
+                self.logger.warning(f"   ⚠️ Cleanup {i+1} failed: {stderr}")
     
     @staticmethod
     def parse_container_setup_config(config_dict: Dict[str, Any]) -> ContainerSetupConfig:
@@ -267,20 +384,16 @@ class ConfigurableContainerSetup:
         
         # Parse file edits
         file_edits = []
-        for file_edit_dict in config_dict.get('file_edits', []):
-            file_edit = FileEdit(
-                file=file_edit_dict['file'],
-                content=file_edit_dict['content'],
-                backup=file_edit_dict.get('backup', True),
-                backup_suffix=file_edit_dict.get('backup_suffix', '.backup'),
-                permissions=file_edit_dict.get('permissions')
-            )
-            file_edits.append(file_edit)
+        if 'file_edits' in config_dict:
+            for edit_dict in config_dict['file_edits']:
+                file_edits.append(FileEdit(**edit_dict))
         
         return ContainerSetupConfig(
             pre_commands=config_dict.get('pre_commands', []),
             file_edits=file_edits,
             valgrind_command=config_dict.get('valgrind_command', ''),
             post_commands=config_dict.get('post_commands', []),
-            cleanup_commands=config_dict.get('cleanup_commands', [])
+            cleanup_commands=config_dict.get('cleanup_commands', []),
+            working_dir=config_dict.get('working_dir'),
+            use_single_session=config_dict.get('use_single_session', True)
         ) 
